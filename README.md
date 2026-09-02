@@ -91,3 +91,13 @@ upower -e
 ```
 
 log ของ bridge อยู่ใน system journal ของ `nut-power-bridge.service`
+
+## ถอนการติดตั้ง
+
+หยุดและ disable service, unload kernel module และลบ binary, systemd unit, config รวมถึง module ที่เคยติดตั้งไว้ทุก kernel:
+
+```bash
+sudo ./uninstall.sh
+```
+
+คำสั่งนี้ไม่ลบ source code ใน repository และไม่ลบข้อมูลรวมใน system journal
