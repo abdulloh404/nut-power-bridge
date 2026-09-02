@@ -1,6 +1,6 @@
 [Unit]
 Description=Expose a NUT UPS as Linux power supplies
-After=network.target systemd-modules-load.service
+After=network.target systemd-modules-load.service nut-server.service
 ConditionPathExists=/sys/kernel/nut_battery/update
 
 [Service]

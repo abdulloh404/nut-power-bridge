@@ -141,7 +141,7 @@ fn poll_connection(
     let mut reader = BufReader::new(stream);
 
     loop {
-        match fetch_snapshot(&mut reader, &config.ups_name) {
+        match fetch_snapshot(&mut reader, &config.ups_name, *last_published_snapshot) {
             Ok(snapshot) => {
                 if let Err(error) = write_snapshot(&config.sysfs_path, &snapshot) {
                     eprintln!(
@@ -173,8 +173,9 @@ fn publish_degraded_once(
         return;
     }
 
-    let Some(mut snapshot) = last_published_snapshot else {
-        return;
+    let mut snapshot = match last_published_snapshot {
+        Some(snapshot) => snapshot,
+        None => return,
     };
     snapshot.status = 0;
 
@@ -207,29 +208,41 @@ fn connect(config: &Config) -> io::Result<TcpStream> {
     }))
 }
 
-fn fetch_snapshot(reader: &mut BufReader<TcpStream>, ups_name: &str) -> io::Result<Snapshot> {
+fn fetch_snapshot(
+    reader: &mut BufReader<TcpStream>,
+    ups_name: &str,
+    last_snapshot: Option<Snapshot>,
+) -> io::Result<Snapshot> {
     let capacity = parse_scaled_integer(
-        &get_var(reader, ups_name, "battery.charge")?,
+        &get_required_var(reader, ups_name, "battery.charge")?,
         1.0,
         0,
         100,
         "battery.charge",
     )?;
-    let time_to_empty_seconds = parse_scaled_integer(
-        &get_var(reader, ups_name, "battery.runtime")?,
+    let time_to_empty_seconds = get_optional_scaled_integer(
+        reader,
+        ups_name,
+        "battery.runtime",
         1.0,
         0,
         i32::MAX,
-        "battery.runtime",
+        last_snapshot
+            .map(|snapshot| snapshot.time_to_empty_seconds)
+            .unwrap_or(0),
     )?;
-    let voltage_now_uv = parse_scaled_integer(
-        &get_var(reader, ups_name, "battery.voltage")?,
+    let voltage_now_uv = get_optional_scaled_integer(
+        reader,
+        ups_name,
+        "battery.voltage",
         1_000_000.0,
         0,
         i32::MAX,
-        "battery.voltage",
+        last_snapshot
+            .map(|snapshot| snapshot.voltage_now_uv)
+            .unwrap_or(0),
     )?;
-    let ups_status = get_var(reader, ups_name, "ups.status")?;
+    let ups_status = get_required_var(reader, ups_name, "ups.status")?;
     let (status, ac_online) = map_status(&ups_status, capacity)?;
 
     Ok(Snapshot {
@@ -245,7 +258,7 @@ fn get_var(
     reader: &mut BufReader<TcpStream>,
     ups_name: &str,
     variable: &str,
-) -> io::Result<String> {
+) -> io::Result<Option<String>> {
     let command = format!("GET VAR {ups_name} {variable}\n");
     reader.get_mut().write_all(command.as_bytes())?;
     reader.get_mut().flush()?;
@@ -263,10 +276,21 @@ fn get_var(
     if response.len() > MAX_RESPONSE_LENGTH {
         return Err(invalid_data("NUT response is too long"));
     }
+    if !response.ends_with('\n') {
+        return Err(invalid_data("NUT response is not newline-terminated"));
+    }
 
     let response = response.trim_end_matches(|character| character == '\r' || character == '\n');
     let tokens = parse_protocol_tokens(response)?;
     if tokens.first().map(String::as_str) == Some("ERR") {
+        if tokens.len() == 2
+            && matches!(
+                tokens[1].as_str(),
+                "VAR-NOT-SUPPORTED" | "VAR-NOT-AVAILABLE"
+            )
+        {
+            return Ok(None);
+        }
         return Err(invalid_data(format!("NUT returned: {response}")));
     }
     if tokens.len() != 4
@@ -279,7 +303,34 @@ fn get_var(
         )));
     }
 
-    Ok(tokens[3].clone())
+    Ok(Some(tokens[3].clone()))
+}
+
+fn get_required_var(
+    reader: &mut BufReader<TcpStream>,
+    ups_name: &str,
+    variable: &str,
+) -> io::Result<String> {
+    get_var(reader, ups_name, variable)?.ok_or_else(|| {
+        invalid_data(format!(
+            "required NUT variable is not available: {variable}"
+        ))
+    })
+}
+
+fn get_optional_scaled_integer(
+    reader: &mut BufReader<TcpStream>,
+    ups_name: &str,
+    variable: &str,
+    scale: f64,
+    minimum: i32,
+    maximum: i32,
+    fallback: i32,
+) -> io::Result<i32> {
+    match get_var(reader, ups_name, variable)? {
+        Some(value) => parse_scaled_integer(&value, scale, minimum, maximum, variable),
+        None => Ok(fallback),
+    }
 }
 
 fn parse_protocol_tokens(line: &str) -> io::Result<Vec<String>> {
@@ -311,10 +362,16 @@ fn parse_protocol_tokens(line: &str) -> io::Result<Vec<String>> {
                         if index == bytes.len() {
                             return Err(invalid_data("unterminated escape in NUT response"));
                         }
+                        if !matches!(bytes[index], b'\\' | b'"') {
+                            return Err(invalid_data("invalid escape in NUT response"));
+                        }
                         token.push(bytes[index]);
                         index += 1;
                     }
                     byte => {
+                        if byte.is_ascii_control() {
+                            return Err(invalid_data("control byte in quoted NUT value"));
+                        }
                         token.push(byte);
                         index += 1;
                     }
@@ -367,8 +424,20 @@ fn parse_scaled_integer(
 
 fn map_status(value: &str, capacity: i32) -> io::Result<(i32, i32)> {
     let statuses: Vec<&str> = value.split_ascii_whitespace().collect();
-    let on_line = statuses.contains(&"OL");
-    let on_battery = statuses.contains(&"OB");
+    if statuses.is_empty()
+        || statuses.iter().any(|status| {
+            !status
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+    {
+        return Err(invalid_data(format!("invalid ups.status value: {value}")));
+    }
+
+    let on_line = statuses.contains(&"OL") || statuses.contains(&"ONLINE");
+    let on_battery = statuses.contains(&"OB")
+        || statuses.contains(&"ONBAT")
+        || statuses.contains(&"ONBATT");
     let charging = statuses.contains(&"CHRG");
     let discharging = statuses.contains(&"DISCHRG");
 
@@ -384,11 +453,11 @@ fn map_status(value: &str, capacity: i32) -> io::Result<(i32, i32)> {
     }
 
     let ac_online = if on_line { 1 } else { 0 };
-    let status = if charging {
-        1
-    } else if discharging || on_battery {
+    let status = if on_battery || discharging {
         2
-    } else if capacity == 100 {
+    } else if charging {
+        1
+    } else if on_line && capacity == 100 {
         4
     } else {
         3

@@ -15,11 +15,13 @@ APC UPS -> usbhid-ups -> upsd -> Rust bridge -> nut_power.ko
 | --- | --- |
 | `battery.charge` | `CAPACITY` |
 | `battery.voltage` | `VOLTAGE_NOW` (microvolts) |
-| `battery.runtime` | `TIME_TO_EMPTY_NOW` (seconds) |
+| `battery.runtime` | `TIME_TO_EMPTY_NOW` (seconds) และค่า energy/power สำหรับ UPower |
 | `ups.status` | battery `STATUS` |
-| `OL` / `OB` ใน `ups.status` | AC `ONLINE` |
+| `OL`/`ONLINE` และ `OB`/`ONBAT`/`ONBATT` ใน `ups.status` | AC `ONLINE` |
 
-สถานะ `CHRG` เป็น `Charging`, `DISCHRG` หรือ `OB` เป็น `Discharging` และ `OL` ที่ไม่มี `CHRG` เป็น `Full` เมื่อความจุ 100% มิฉะนั้นเป็น `Not charging`
+สถานะ `CHRG` เป็น `Charging`, `DISCHRG` หรือ `OB`/`ONBAT`/`ONBATT` เป็น `Discharging` และ `OL`/`ONLINE` ที่ไม่มี `CHRG` เป็น `Full` เมื่อความจุ 100% มิฉะนั้นเป็น `Not charging`
+
+module สร้าง `nut-battery` และ `nut-ac` ตั้งแต่ถูกโหลด โดยเริ่มด้วยสถานะ `Unknown`, AC online และความจุเริ่มต้นที่ไม่ทำให้ UPower ตีความว่าแบตวิกฤต จากนั้น daemon จะเขียนค่าจริงทับทันทีที่อ่าน snapshot แรกจาก NUT สำเร็จ ทำให้อุปกรณ์ยังอยู่ใน UPower แม้ `upsd` จะเริ่มช้าหรือหลุดชั่วคราว
 
 ## สิ่งที่ต้องมี
 
@@ -66,9 +68,11 @@ NUT_SYSFS_PATH=/sys/kernel/nut_battery/update
 
 จากนั้นให้ผู้ดูแลระบบนำ service กลับมาใช้ค่าชุดใหม่ตามขั้นตอนปกติของเครื่อง
 
-daemon คุย NUT text protocol ผ่าน TCP โดยตรง ไม่ได้เรียก `upsc` ซ้ำทุก poll และจะ reconnect เองเมื่อ `upsd` หลุด
+daemon คุย NUT text protocol ผ่าน TCP โดยตรง ไม่ได้เรียก `upsc` ซ้ำทุก poll และจะ reconnect เองเมื่อ `upsd` หลุด `battery.charge` และ `ups.status` เป็นค่าหลักที่ต้องมี ส่วน `battery.runtime` และ `battery.voltage` จะใช้ค่าล่าสุด หรือ `0` หาก UPS รุ่นนั้นไม่รองรับ
 
-`nut-battery` และ `nut-ac` จะถูกสร้างหลัง daemon ส่ง snapshot ที่สมบูรณ์ครั้งแรก จึงไม่มีแบตเตอรี่ 0% ปรากฏระหว่างรอ NUT เมื่อเคยรับข้อมูลแล้วแต่การเชื่อมต่อหลุด bridge จะคงค่าล่าสุดและเปลี่ยน battery status เป็น `Unknown` จนกว่าจะอ่าน snapshot ใหม่สำเร็จ
+เมื่อเคยรับข้อมูลแล้วแต่การเชื่อมต่อหลุด bridge จะคงเปอร์เซ็นต์, runtime, voltage และสถานะ AC ล่าสุดไว้ พร้อมเปลี่ยน battery status เป็น `Unknown` จนกว่าจะอ่าน snapshot ใหม่สำเร็จ
+
+เพื่อรองรับ UPower 0.99.17 module จะ expose ค่า energy เต็มแบบ normalized 100 Wh, คำนวณ energy ปัจจุบันจากเปอร์เซ็นต์ และคำนวณ power จาก `battery.runtime` อัตราส่วนนี้ทำให้ UPower แสดง `time to empty` ตรงกับ NUT ขณะสถานะเป็น `Discharging`; ค่า energy/power ดังกล่าวใช้สำหรับคำนวณเวลา ไม่ใช่ค่าพลังงานจริงของ UPS
 
 ## ตรวจค่า
 
@@ -88,7 +92,12 @@ cat /sys/class/power_supply/nut-battery/time_to_empty_now
 cat /sys/class/power_supply/nut-battery/status
 cat /sys/class/power_supply/nut-ac/online
 upower -e
+upower -i /org/freedesktop/UPower/devices/battery_nut_battery
+upower -i /org/freedesktop/UPower/devices/line_power_nut_ac
+upower -d
 ```
+
+เมื่อ NUT รายงาน `OB`/`ONBAT`/`ONBATT` ควรเห็น battery เป็น `discharging`, line power เป็น `online: no` และ `on-battery: yes` ใน `upower -d` เมื่อรายงาน `OL`/`ONLINE` ควรเห็น line power เป็น `online: yes`; `CHRG` จะแสดง `charging`
 
 log ของ bridge อยู่ใน system journal ของ `nut-power-bridge.service`
 
