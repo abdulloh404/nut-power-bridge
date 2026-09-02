@@ -1,0 +1,11 @@
+/daemon/target/
+/kernel/.*.cmd
+/kernel/.tmp_versions/
+/kernel/*.ko
+/kernel/*.mod
+/kernel/*.mod.c
+/kernel/*.mod.o
+/kernel/*.o
+/kernel/Module.symvers
+/kernel/modules.order
+

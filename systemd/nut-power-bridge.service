@@ -1,0 +1,22 @@
+[Unit]
+Description=Expose a NUT UPS as Linux power supplies
+After=network.target systemd-modules-load.service
+ConditionPathExists=/sys/kernel/nut_battery/update
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/nut-power-bridge
+ExecStart=/usr/local/sbin/nut-power-bridge
+Restart=on-failure
+RestartSec=5s
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/sys/kernel/nut_battery
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
