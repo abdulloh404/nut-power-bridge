@@ -11,6 +11,7 @@
 
 #define NUT_UPDATE_MAX_SIZE 128
 #define NUT_ENERGY_FULL_UWH 100000000
+#define NUT_CHARGING_ENERGY_FLOOR_UWH 101000
 #define NUT_SECONDS_PER_HOUR 3600
 
 struct nut_power_snapshot {
@@ -19,6 +20,7 @@ struct nut_power_snapshot {
 	int time_to_empty_sec;
 	int status;
 	int ac_online;
+	int time_to_full_sec;
 };
 
 struct nut_power_state {
@@ -36,6 +38,7 @@ static const enum power_supply_property nut_battery_properties[] = {
 	POWER_SUPPLY_PROP_CAPACITY,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW,
+	POWER_SUPPLY_PROP_TIME_TO_FULL_NOW,
 	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_PRESENT,
 	POWER_SUPPLY_PROP_SCOPE,
@@ -57,20 +60,41 @@ static int nut_energy_now_uwh(const struct nut_power_snapshot *snapshot)
 	energy_now = div64_s64((s64)snapshot->capacity * NUT_ENERGY_FULL_UWH,
 			       100);
 
+	// UPower ไม่คำนวณเวลาหาก energy ต่ำกว่า 0.1 Wh แม้มีอัตราชาร์จ
+	if (snapshot->status == POWER_SUPPLY_STATUS_CHARGING &&
+	    snapshot->ac_online && snapshot->capacity == 0)
+		energy_now = NUT_CHARGING_ENERGY_FLOOR_UWH;
+
 	return clamp_t(s64, energy_now, 0, NUT_ENERGY_FULL_UWH);
+}
+
+static int nut_time_to_full_sec(const struct nut_power_snapshot *snapshot)
+{
+	if (snapshot->status != POWER_SUPPLY_STATUS_CHARGING ||
+	    !snapshot->ac_online || snapshot->capacity >= 100)
+		return 0;
+
+	return snapshot->time_to_full_sec;
 }
 
 static int nut_power_now_uw(const struct nut_power_snapshot *snapshot)
 {
 	s64 power_now;
+	int time_to_full_sec = nut_time_to_full_sec(snapshot);
 
-	if (snapshot->status != POWER_SUPPLY_STATUS_DISCHARGING ||
-	    snapshot->time_to_empty_sec <= 0)
+	if (snapshot->status == POWER_SUPPLY_STATUS_DISCHARGING &&
+	    snapshot->time_to_empty_sec > 0) {
+		power_now = div64_s64((s64)nut_energy_now_uwh(snapshot) *
+				      NUT_SECONDS_PER_HOUR,
+				      snapshot->time_to_empty_sec);
+	} else if (time_to_full_sec > 0) {
+		power_now = div64_s64((s64)(NUT_ENERGY_FULL_UWH -
+				      nut_energy_now_uwh(snapshot)) *
+				      NUT_SECONDS_PER_HOUR,
+				      time_to_full_sec);
+	} else {
 		return 0;
-
-	power_now = div64_s64((s64)nut_energy_now_uwh(snapshot) *
-			      NUT_SECONDS_PER_HOUR,
-			      snapshot->time_to_empty_sec);
+	}
 
 	return clamp_t(s64, power_now, 0, INT_MAX);
 }
@@ -92,6 +116,9 @@ static int nut_battery_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW:
 		value->intval = state->snapshot.time_to_empty_sec;
+		break;
+	case POWER_SUPPLY_PROP_TIME_TO_FULL_NOW:
+		value->intval = nut_time_to_full_sec(&state->snapshot);
 		break;
 	case POWER_SUPPLY_PROP_STATUS:
 		value->intval = state->snapshot.status;
@@ -185,7 +212,7 @@ static int nut_power_register_supplies(struct nut_power_state *state)
 static int nut_power_parse_snapshot(char *input,
 				    struct nut_power_snapshot *snapshot)
 {
-	int values[5];
+	int values[6] = { 0 };
 	char *cursor = input;
 	char *token;
 	size_t field = 0;
@@ -203,7 +230,7 @@ static int nut_power_parse_snapshot(char *input,
 		field++;
 	}
 
-	if (field != ARRAY_SIZE(values))
+	if (field != 5 && field != ARRAY_SIZE(values))
 		return -EINVAL;
 
 	snapshot->capacity = values[0];
@@ -211,6 +238,7 @@ static int nut_power_parse_snapshot(char *input,
 	snapshot->time_to_empty_sec = values[2];
 	snapshot->status = values[3];
 	snapshot->ac_online = values[4];
+	snapshot->time_to_full_sec = values[5];
 
 	return 0;
 }
@@ -239,6 +267,7 @@ static ssize_t update_store(struct kobject *kobj,
 
 	if (next.capacity < 0 || next.capacity > 100 ||
 	    next.voltage_now_uv < 0 || next.time_to_empty_sec < 0 ||
+	    next.time_to_full_sec < 0 ||
 	    next.status < POWER_SUPPLY_STATUS_UNKNOWN ||
 	    next.status > POWER_SUPPLY_STATUS_FULL ||
 	    (next.ac_online != 0 && next.ac_online != 1))
@@ -260,6 +289,15 @@ static ssize_t update_store(struct kobject *kobj,
 }
 
 static struct kobj_attribute update_attribute = __ATTR_WO(update);
+
+static ssize_t protocol_version_show(struct kobject *kobj,
+				    struct kobj_attribute *attribute, char *buf)
+{
+	return sysfs_emit(buf, "2\n");
+}
+
+static struct kobj_attribute protocol_version_attribute =
+	__ATTR_RO(protocol_version);
 
 static int __init nut_power_init(void)
 {
@@ -285,8 +323,14 @@ static int __init nut_power_init(void)
 	if (ret)
 		goto put_kobject;
 
+	ret = sysfs_create_file(nut_power_kobj, &protocol_version_attribute.attr);
+	if (ret)
+		goto remove_update;
+
 	return 0;
 
+remove_update:
+	sysfs_remove_file(nut_power_kobj, &update_attribute.attr);
 put_kobject:
 	kobject_put(nut_power_kobj);
 unregister_supplies:
@@ -300,6 +344,7 @@ static void __exit nut_power_exit(void)
 	struct power_supply *battery;
 	struct power_supply *ac;
 
+	sysfs_remove_file(nut_power_kobj, &protocol_version_attribute.attr);
 	sysfs_remove_file(nut_power_kobj, &update_attribute.attr);
 	kobject_put(nut_power_kobj);
 

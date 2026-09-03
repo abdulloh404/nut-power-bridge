@@ -54,6 +54,9 @@ rm -f -- \
     /etc/modules-load.d/nut-power-bridge.conf \
     /etc/default/nut-power-bridge
 
+echo "Removing charging-rate state from /var/lib/nut-power-bridge"
+rm -rf -- /var/lib/nut-power-bridge
+
 for kernel_version in "${!affected_kernel_versions[@]}"; do
     depmod -a "${kernel_version}"
 done

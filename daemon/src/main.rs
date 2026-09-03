@@ -1,5 +1,11 @@
+mod charging;
+
+use charging::{
+    ChargeSource, ChargingEstimator, DEFAULT_CHARGE_FULL_SECONDS,
+    MAX_TIME_TO_FULL_SECONDS, MIN_CHARGE_FULL_SECONDS,
+};
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -12,6 +18,7 @@ const DEFAULT_UPS_NAME: &str = "ups";
 const DEFAULT_POLL_INTERVAL_SECONDS: u64 = 2;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_SYSFS_PATH: &str = "/sys/kernel/nut_battery/update";
+const DEFAULT_CHARGE_STATE_PATH: &str = "/var/lib/nut-power-bridge/charge-rate";
 const MAX_RESPONSE_LENGTH: usize = 4096;
 
 struct Config {
@@ -20,6 +27,9 @@ struct Config {
     poll_interval: Duration,
     timeout: Duration,
     sysfs_path: PathBuf,
+    charge_full_seconds: u64,
+    charge_state_path: PathBuf,
+    time_to_full_var: Option<String>,
 }
 
 impl Config {
@@ -34,6 +44,14 @@ impl Config {
         let mut sysfs_path = env::var_os("NUT_SYSFS_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_SYSFS_PATH));
+        let charge_full_seconds = env_u64(
+            "NUT_CHARGE_FULL_SECONDS",
+            DEFAULT_CHARGE_FULL_SECONDS,
+        )?;
+        let charge_state_path = env::var_os("NUT_CHARGE_STATE_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_CHARGE_STATE_PATH));
+        let time_to_full_var = env_string("NUT_TIME_TO_FULL_VAR", "")?;
 
         let mut args = env::args().skip(1);
         while let Some(argument) = args.next() {
@@ -60,7 +78,8 @@ impl Config {
                         "Usage: nut-power-bridge [--host HOST:PORT] [--ups NAME] \
                          [--interval SECONDS] [--timeout SECONDS] [--sysfs-path PATH]\n\
                          Environment: NUT_HOST, NUT_UPS_NAME, \
-                         NUT_POLL_INTERVAL_SECONDS, NUT_TIMEOUT_SECONDS, NUT_SYSFS_PATH"
+                         NUT_POLL_INTERVAL_SECONDS, NUT_TIMEOUT_SECONDS, NUT_SYSFS_PATH, \
+                         NUT_CHARGE_FULL_SECONDS, NUT_CHARGE_STATE_PATH, NUT_TIME_TO_FULL_VAR"
                     );
                     process::exit(0);
                 }
@@ -75,13 +94,38 @@ impl Config {
         if sysfs_path.as_os_str().is_empty() {
             return Err("sysfs path must not be empty".to_owned());
         }
-
+        if !(MIN_CHARGE_FULL_SECONDS..=MAX_TIME_TO_FULL_SECONDS)
+            .contains(&charge_full_seconds)
+        {
+            return Err(format!(
+                "NUT_CHARGE_FULL_SECONDS must be between {MIN_CHARGE_FULL_SECONDS} \
+                 and {MAX_TIME_TO_FULL_SECONDS} seconds"
+            ));
+        }
+        if charge_state_path.as_os_str().is_empty() || charge_state_path.file_name().is_none() {
+            return Err("NUT_CHARGE_STATE_PATH must name a state file".to_owned());
+        }
+        let time_to_full_var = if time_to_full_var.is_empty() {
+            None
+        } else {
+            validate_protocol_token(&time_to_full_var, "NUT_TIME_TO_FULL_VAR")?;
+            if matches!(
+                time_to_full_var.as_str(),
+                "battery.runtime" | "battery.runtime.low" | "battery.runtime.restart"
+            ) {
+                return Err("NUT_TIME_TO_FULL_VAR must describe charging time, not discharge runtime".to_owned());
+            }
+            Some(time_to_full_var)
+        };
         Ok(Self {
             host,
             ups_name,
             poll_interval: Duration::from_secs(poll_interval_seconds),
             timeout: Duration::from_secs(timeout_seconds),
             sysfs_path,
+            charge_full_seconds,
+            charge_state_path,
+            time_to_full_var,
         })
     }
 }
@@ -93,6 +137,8 @@ struct Snapshot {
     time_to_empty_seconds: i32,
     status: i32,
     ac_online: i32,
+    time_to_full_seconds: i32,
+    charge_source: Option<ChargeSource>,
 }
 
 fn main() {
@@ -106,6 +152,19 @@ fn main() {
 
     let mut last_published_snapshot = None;
     let mut degraded_published = false;
+    let mut charging = ChargingEstimator::new(
+        config.charge_state_path.clone(),
+        format!("{} {}", config.host, config.ups_name),
+        config.charge_full_seconds,
+        config.poll_interval.saturating_mul(3).max(Duration::from_secs(15)),
+    );
+
+    if !kernel_supports_charge_time(&config.sysfs_path) {
+        eprintln!(
+            "kernel module uses the legacy snapshot format; battery updates continue, \
+             but charging-time support requires reloading nut_power or rebooting after installation"
+        );
+    }
 
     loop {
         match connect(&config) {
@@ -116,10 +175,12 @@ fn main() {
                     &config,
                     &mut last_published_snapshot,
                     &mut degraded_published,
+                    &mut charging,
                 );
             }
             Err(error) => {
                 eprintln!("cannot connect to NUT at {}: {error}", config.host);
+                charging.reset_session();
                 publish_degraded_once(
                     &config,
                     last_published_snapshot,
@@ -137,24 +198,42 @@ fn poll_connection(
     config: &Config,
     last_published_snapshot: &mut Option<Snapshot>,
     degraded_published: &mut bool,
+    charging: &mut ChargingEstimator,
 ) {
     let mut reader = BufReader::new(stream);
 
     loop {
-        match fetch_snapshot(&mut reader, &config.ups_name, *last_published_snapshot) {
+        match fetch_snapshot(&mut reader, config, *last_published_snapshot, charging) {
             Ok(snapshot) => {
-                if let Err(error) = write_snapshot(&config.sysfs_path, &snapshot) {
+                if let Err(error) = write_snapshot(config, &snapshot) {
                     eprintln!(
                         "cannot update {}: {error}",
                         config.sysfs_path.display()
                     );
                 } else {
+                    if snapshot.charge_source
+                        != last_published_snapshot.and_then(|previous| previous.charge_source)
+                    {
+                        if let Some(source) = snapshot.charge_source {
+                            let description = match source {
+                                ChargeSource::UpsTime => "UPS time-to-full variable",
+                                ChargeSource::UpsCurrent => "UPS battery current and capacity",
+                                ChargeSource::Learned => "learned charging rate",
+                                ChargeSource::Fallback => "configured fallback charging rate",
+                            };
+                            eprintln!(
+                                "charging time source: {description}; time to full: {} seconds",
+                                snapshot.time_to_full_seconds
+                            );
+                        }
+                    }
                     *last_published_snapshot = Some(snapshot);
                     *degraded_published = false;
                 }
             }
             Err(error) => {
                 eprintln!("NUT connection lost or returned invalid data: {error}");
+                charging.reset_session();
                 publish_degraded_once(config, *last_published_snapshot, degraded_published);
                 return;
             }
@@ -178,8 +257,10 @@ fn publish_degraded_once(
         None => return,
     };
     snapshot.status = 0;
+    snapshot.time_to_full_seconds = 0;
+    snapshot.charge_source = None;
 
-    match write_snapshot(&config.sysfs_path, &snapshot) {
+    match write_snapshot(config, &snapshot) {
         Ok(()) => *degraded_published = true,
         Err(error) => eprintln!(
             "cannot mark {} as unavailable: {error}",
@@ -210,9 +291,11 @@ fn connect(config: &Config) -> io::Result<TcpStream> {
 
 fn fetch_snapshot(
     reader: &mut BufReader<TcpStream>,
-    ups_name: &str,
+    config: &Config,
     last_snapshot: Option<Snapshot>,
+    charging: &mut ChargingEstimator,
 ) -> io::Result<Snapshot> {
+    let ups_name = &config.ups_name;
     let capacity = parse_scaled_integer(
         &get_required_var(reader, ups_name, "battery.charge")?,
         1.0,
@@ -244,6 +327,12 @@ fn fetch_snapshot(
     )?;
     let ups_status = get_required_var(reader, ups_name, "ups.status")?;
     let (status, ac_online) = map_status(&ups_status, capacity)?;
+    let ups_charge_time = if status == 1 && ac_online == 1 && capacity < 100 {
+        get_ups_charge_time(reader, config, capacity)?
+    } else {
+        None
+    };
+    let charge_estimate = charging.update(capacity, status, ac_online, ups_charge_time);
 
     Ok(Snapshot {
         capacity,
@@ -251,7 +340,49 @@ fn fetch_snapshot(
         time_to_empty_seconds,
         status,
         ac_online,
+        time_to_full_seconds: charge_estimate.seconds,
+        charge_source: charge_estimate.source,
     })
+}
+
+fn get_ups_charge_time(
+    reader: &mut BufReader<TcpStream>,
+    config: &Config,
+    capacity: i32,
+) -> io::Result<Option<(f64, ChargeSource)>> {
+    if let Some(variable) = &config.time_to_full_var {
+        if let Some(seconds) = get_optional_number(reader, &config.ups_name, variable)? {
+            if seconds > 0.0 {
+                return Ok(Some((seconds, ChargeSource::UpsTime)));
+            }
+        }
+    }
+
+    let amp_hours = get_optional_number(reader, &config.ups_name, "battery.capacity")?;
+    if let Some(amp_hours) = amp_hours.filter(|value| *value > 0.0) {
+        let current = get_optional_number(reader, &config.ups_name, "battery.current")?;
+        if let Some(current) = current.filter(|value| value.abs() > 0.0) {
+            // ใช้ขนาด battery.current เฉพาะเมื่อ UPS ยืนยันสถานะ Charging เท่านั้น
+            let seconds = 3600.0 * amp_hours * (100 - capacity) as f64
+                / (100.0 * current.abs());
+            if seconds.is_finite() && seconds > 0.0 {
+                return Ok(Some((seconds, ChargeSource::UpsCurrent)));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn get_optional_number(
+    reader: &mut BufReader<TcpStream>,
+    ups_name: &str,
+    variable: &str,
+) -> io::Result<Option<f64>> {
+    // ข้อมูลชาร์จที่ไม่มีหรือใช้ไม่ได้ต้องไม่ทำให้ค่าหลักของแบตเตอรี่หยุดอัปเดต
+    Ok(get_var(reader, ups_name, variable)?
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite()))
 }
 
 fn get_var(
@@ -466,16 +597,32 @@ fn map_status(value: &str, capacity: i32) -> io::Result<(i32, i32)> {
     Ok((status, ac_online))
 }
 
-fn write_snapshot(path: &Path, snapshot: &Snapshot) -> io::Result<()> {
-    let line = format!(
-        "{} {} {} {} {}\n",
+fn kernel_supports_charge_time(update_path: &Path) -> bool {
+    let version_path = update_path.with_file_name("protocol_version");
+    match fs::read_to_string(&version_path) {
+        Ok(version) => version.trim() == "2",
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            eprintln!("cannot read {}: {error}", version_path.display());
+            false
+        }
+    }
+}
+
+fn write_snapshot(config: &Config, snapshot: &Snapshot) -> io::Result<()> {
+    let mut line = format!(
+        "{} {} {} {} {}",
         snapshot.capacity,
         snapshot.voltage_now_uv,
         snapshot.time_to_empty_seconds,
         snapshot.status,
         snapshot.ac_online
     );
-    let mut file = OpenOptions::new().write(true).open(path)?;
+    if kernel_supports_charge_time(&config.sysfs_path) {
+        line.push_str(&format!(" {}", snapshot.time_to_full_seconds));
+    }
+    line.push('\n');
+    let mut file = OpenOptions::new().write(true).open(&config.sysfs_path)?;
     file.write_all(line.as_bytes())
 }
 
