@@ -1,6 +1,6 @@
 # nut-power-bridge
 
-เชื่อมข้อมูล UPS จาก NUT เข้ากับ Linux `power_supply` เพื่อให้ UPower และ GNOME อ่านค่าได้ โดย `usbhid-ups` ยังคงเป็นผู้ครอบครองอุปกรณ์ USB เพียงตัวเดียว
+Expose UPS data from NUT through the Linux `power_supply` subsystem so UPower and GNOME can read it, while `usbhid-ups` remains the sole owner of the USB device.
 
 ```text
 APC UPS -> usbhid-ups -> upsd -> Rust bridge -> nut_power.ko
@@ -9,54 +9,54 @@ APC UPS -> usbhid-ups -> upsd -> Rust bridge -> nut_power.ko
                                                      -> UPower -> GNOME
 ```
 
-รุ่นแรกส่งข้อมูล 5 ค่า:
+The initial version publishes five values:
 
 | NUT | Linux `power_supply` |
 | --- | --- |
 | `battery.charge` | `CAPACITY` |
 | `battery.voltage` | `VOLTAGE_NOW` (microvolts) |
-| `battery.runtime` | `TIME_TO_EMPTY_NOW` (seconds) และค่า energy/power สำหรับ UPower |
+| `battery.runtime` | `TIME_TO_EMPTY_NOW` (seconds) and energy/power values for UPower |
 | `ups.status` | battery `STATUS` |
-| `OL`/`ONLINE` และ `OB`/`ONBAT`/`ONBATT` ใน `ups.status` | AC `ONLINE` |
+| `OL`/`ONLINE` and `OB`/`ONBAT`/`ONBATT` in `ups.status` | AC `ONLINE` |
 
-สถานะ `CHRG` เป็น `Charging`, `DISCHRG` หรือ `OB`/`ONBAT`/`ONBATT` เป็น `Discharging` และ `OL`/`ONLINE` ที่ไม่มี `CHRG` เป็น `Full` เมื่อความจุ 100% มิฉะนั้นเป็น `Not charging`
+`CHRG` maps to `Charging`, while `DISCHRG` or `OB`/`ONBAT`/`ONBATT` maps to `Discharging`. `OL`/`ONLINE` without `CHRG` maps to `Full` at 100% capacity, or `Not charging` otherwise.
 
-module สร้าง `nut-battery` และ `nut-ac` ตั้งแต่ถูกโหลด โดยเริ่มด้วยสถานะ `Unknown`, AC online และความจุเริ่มต้นที่ไม่ทำให้ UPower ตีความว่าแบตวิกฤต จากนั้น daemon จะเขียนค่าจริงทับทันทีที่อ่าน snapshot แรกจาก NUT สำเร็จ ทำให้อุปกรณ์ยังอยู่ใน UPower แม้ `upsd` จะเริ่มช้าหรือหลุดชั่วคราว
+The module registers `nut-battery` and `nut-ac` as soon as it loads, with an initial status of `Unknown`, AC online, and an initial capacity that prevents UPower from treating the battery as critically low. The daemon replaces these values as soon as it reads the first snapshot from NUT. This keeps the devices visible in UPower even if `upsd` starts late or temporarily disconnects.
 
-## สิ่งที่ต้องมี
+## Requirements
 
-- NUT `upsd` ที่อ่าน UPS ผ่าน `usbhid-ups` ได้แล้ว
+- NUT `upsd` already reading the UPS through `usbhid-ups`
 - Rust toolchain (`cargo`)
-- `make`, compiler และ kernel headers ที่ตรงกับ kernel ปัจจุบัน
-- UPower สำหรับส่งข้อมูลต่อให้ desktop
+- `make`, a compiler, and kernel headers matching the running kernel
+- UPower to provide power information to the desktop
 
-บน Ubuntu/Debian kernel headers ปกติติดตั้งด้วย:
+On Ubuntu/Debian, install the build tools and kernel headers with:
 
 ```bash
 sudo apt install build-essential linux-headers-$(uname -r) cargo
 ```
 
-## Build และติดตั้ง
+## Build and install
 
-Build daemon และ kernel module:
+Build the daemon and kernel module:
 
 ```bash
 make
 ```
 
-ติดตั้ง binary, module และ systemd service:
+Install the binary, module, and systemd service:
 
 ```bash
 sudo ./install.sh
 ```
 
-ตัวติดตั้งจะโหลด `nut_power`, เปิดใช้ `nut-power-bridge.service` และเก็บ module ไว้สำหรับ kernel ปัจจุบัน เมื่อเปลี่ยน kernel ต้อง build และติดตั้ง module ใหม่
+The installer loads `nut_power`, enables `nut-power-bridge.service`, and installs the module for the running kernel. Rebuild and reinstall the module when switching to a different kernel.
 
-หากติดตั้งทับขณะที่ `nut_power` ถูกโหลดอยู่ ตัวติดตั้งจะไม่ถอด module ที่กำลังใช้งาน ให้ reboot หรือ reload module ภายหลังเพื่อเริ่มใช้ไฟล์ module รุ่นใหม่
+If `nut_power` is already loaded when reinstalling, the installer does not unload the active module. Reboot or reload the module later to use the newly installed version.
 
-## ตั้งค่า
+## Configuration
 
-แก้ `/etc/default/nut-power-bridge` หากค่าเริ่มต้นไม่ตรงกับ NUT:
+Edit `/etc/default/nut-power-bridge` if the defaults do not match your NUT setup:
 
 ```ini
 NUT_HOST=127.0.0.1:3493
@@ -66,24 +66,24 @@ NUT_TIMEOUT_SECONDS=5
 NUT_SYSFS_PATH=/sys/kernel/nut_battery/update
 ```
 
-จากนั้นให้ผู้ดูแลระบบนำ service กลับมาใช้ค่าชุดใหม่ตามขั้นตอนปกติของเครื่อง
+Then have the system administrator apply the updated configuration using the system's usual service management procedure.
 
-daemon คุย NUT text protocol ผ่าน TCP โดยตรง ไม่ได้เรียก `upsc` ซ้ำทุก poll และจะ reconnect เองเมื่อ `upsd` หลุด `battery.charge` และ `ups.status` เป็นค่าหลักที่ต้องมี ส่วน `battery.runtime` และ `battery.voltage` จะใช้ค่าล่าสุด หรือ `0` หาก UPS รุ่นนั้นไม่รองรับ
+The daemon communicates directly with the NUT text protocol over TCP instead of invoking `upsc` on every poll. It reconnects automatically if the connection to `upsd` is lost. `battery.charge` and `ups.status` are required. The optional `battery.runtime` and `battery.voltage` values fall back to their last known values, or `0` if the UPS does not support them and no previous values are available.
 
-เมื่อเคยรับข้อมูลแล้วแต่การเชื่อมต่อหลุด bridge จะคงเปอร์เซ็นต์, runtime, voltage และสถานะ AC ล่าสุดไว้ พร้อมเปลี่ยน battery status เป็น `Unknown` จนกว่าจะอ่าน snapshot ใหม่สำเร็จ
+If the connection is lost after receiving data, the bridge retains the last known percentage, runtime, voltage, and AC status, while setting the battery status to `Unknown` until it successfully reads a new snapshot.
 
-เพื่อรองรับ UPower 0.99.17 module จะ expose ค่า energy เต็มแบบ normalized 100 Wh, คำนวณ energy ปัจจุบันจากเปอร์เซ็นต์ และคำนวณ power จาก `battery.runtime` อัตราส่วนนี้ทำให้ UPower แสดง `time to empty` ตรงกับ NUT ขณะสถานะเป็น `Discharging`; ค่า energy/power ดังกล่าวใช้สำหรับคำนวณเวลา ไม่ใช่ค่าพลังงานจริงของ UPS
+For compatibility with UPower 0.99.17, the module exposes a normalized full energy value of 100 Wh, calculates the current energy from the battery percentage, and derives power from `battery.runtime`. This ratio allows UPower to display a `time to empty` matching NUT while the status is `Discharging`. These energy and power values are used only to calculate time estimates; they are not the UPS's actual energy or power measurements.
 
-## ตรวจค่า
+## Inspect values
 
-หลังติดตั้ง ค่าจาก kernel อยู่ที่:
+After installation, the kernel exposes values at:
 
 ```text
 /sys/class/power_supply/nut-battery/
 /sys/class/power_supply/nut-ac/
 ```
 
-ตัวอย่างตรวจค่า:
+Example commands to inspect the values:
 
 ```bash
 cat /sys/class/power_supply/nut-battery/capacity
@@ -97,16 +97,16 @@ upower -i /org/freedesktop/UPower/devices/line_power_nut_ac
 upower -d
 ```
 
-เมื่อ NUT รายงาน `OB`/`ONBAT`/`ONBATT` ควรเห็น battery เป็น `discharging`, line power เป็น `online: no` และ `on-battery: yes` ใน `upower -d` เมื่อรายงาน `OL`/`ONLINE` ควรเห็น line power เป็น `online: yes`; `CHRG` จะแสดง `charging`
+When NUT reports `OB`/`ONBAT`/`ONBATT`, `upower -d` should show the battery as `discharging`, line power as `online: no`, and `on-battery: yes`. When NUT reports `OL`/`ONLINE`, line power should show `online: yes`; `CHRG` should show the battery as `charging`.
 
-log ของ bridge อยู่ใน system journal ของ `nut-power-bridge.service`
+Bridge logs are available in the system journal under `nut-power-bridge.service`.
 
-## ถอนการติดตั้ง
+## Uninstall
 
-หยุดและ disable service, unload kernel module และลบ binary, systemd unit, config รวมถึง module ที่เคยติดตั้งไว้ทุก kernel:
+Stop and disable the service, unload the kernel module, and remove the binary, systemd unit, configuration, and modules installed for all kernel versions:
 
 ```bash
 sudo ./uninstall.sh
 ```
 
-คำสั่งนี้ไม่ลบ source code ใน repository และไม่ลบข้อมูลรวมใน system journal
+This command does not remove the source code in the repository or erase the system journal.
